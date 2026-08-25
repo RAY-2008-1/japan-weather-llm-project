@@ -1,14 +1,19 @@
 """
 weather_data.csv を集計し、Ollama上のローカルLLMに解釈・比較させて
-自然言語のレポートを生成するプロトタイプ。
+自然言語のレポートを生成するプロトタイプ (v2)。
 
-設計方針:
-  - 672行の生データをそのままLLMに渡すとコンテキストを圧迫し、数値の読み違いも起きやすい。
-  - そこで pandas で都市ごとの統計量と異常値(zスコア)を先に計算し、
-    要約済みの構造化データとしてLLMに渡す。LLMの役割は計算ではなく「解釈・言語化・比較」に絞る。
+設計方針（v1からの変更点）:
+  - v1では集計済みの数値JSONをそのままLLMに渡していたが、7B級モデルは
+    複数都市にまたがる数値を横断的に正確に扱うのが苦手で、数値の取り違えが発生した。
+  - v2では具体的な数値（℃・mm・m/s）を一切LLMに渡さない。数値の集計・表示はすべて
+    コードが直接行い、LLMには「どの都市がどの項目で何位か」という順位関係と、
+    異常が見られた時刻（すでに正しい値）だけを渡す。
+  - LLMの役割を「数値の記憶・再現」から「定性的な解釈・比較の言語化」に完全に限定することで、
+    数値誤りが構造的に起こらないようにする。
+  - それでも指示を無視して数値を書いてしまうケースに備え、出力に数値+単位が
+    含まれていないかを自動チェックする。
 """
 
-import json
 import re
 import sys
 
@@ -21,13 +26,11 @@ CSV_PATH = "weather_data.csv"
 Z_THRESHOLD = 2.0
 MAX_ANOMALIES_PER_CITY = 5
 NUM_CTX = 8192
-NUMBER_TOLERANCE = 0.15
 NUMBER_UNIT_RE = re.compile(r"(-?\d+\.?\d*)\s*(℃|°C|mm|m/s|時間)")
 
 
 def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, parse_dates=["time"])
-    return df
+    return pd.read_csv(path, parse_dates=["time"])
 
 
 def summarize_city(df: pd.DataFrame, city: str) -> dict:
@@ -75,62 +78,97 @@ def summarize_city(df: pd.DataFrame, city: str) -> dict:
     }
 
 
-def build_prompt(summaries: list[dict]) -> str:
-    data_json = json.dumps(summaries, ensure_ascii=False, indent=2)
-    return f"""あなたは気象データ分析の専門家です。以下は日本の4都市（秋田・新潟・金沢・東京）の
-2026年5月20日〜26日の気象統計データ（気温・降水量・風速）です。数値はすでに集計済みです。
-
-```json
-{data_json}
-```
-
-このデータをもとに、日本語で以下の構成のレポートを書いてください:
-
-1. 【都市ごとの特徴】各都市の気温・降水・風速の傾向を1〜2文で
-2. 【異常値・注目ポイント】anomaliesに挙がっている時刻について、何が起きていた可能性があるか
-3. 【都市間比較】4都市の中で最も対照的な2都市を挙げ、その違いを説明
-4. 【総括】この週の気象パターンから言えることを2〜3文で
-
-必ず4都市（新潟・東京・秋田・金沢）すべてに言及し、"city"フィールドの値をそのまま都市名として使ってください。
-「都市A」のような言い換えはしないでください。数値を捏造せず、与えられたデータの範囲内で述べてください。"""
-
-
-def collect_known_values(summaries: list[dict]) -> set[float]:
-    """summarize_city() が計算した「本当の」数値を1個の集合にまとめる。
-    LLMの出力に登場する数値がこの集合に含まれなければ、元データにない値=誤りの疑いとみなす。"""
-    known: set[float] = set()
+def render_data_table(summaries: list[dict]) -> str:
+    """数値はここでコードが直接書く。LLMはこの表を書く工程に一切関与しない。"""
+    header = (
+        "| 都市 | 平均気温(℃) | 最低(℃) | 最高(℃) | 総降水量(mm) | 降雨時間 "
+        "| 平均風速(m/s) | 最大風速(m/s) |"
+    )
+    sep = "|---|---|---|---|---|---|---|---|"
+    rows = []
     for s in summaries:
-        known.add(round(s["temperature"]["mean"], 1))
-        known.add(round(s["temperature"]["min"], 1))
-        known.add(round(s["temperature"]["max"], 1))
-        known.add(round(s["precipitation"]["total_mm"], 1))
-        known.add(float(s["precipitation"]["rain_hours"]))
-        known.add(round(s["windspeed"]["mean"], 1))
-        known.add(round(s["windspeed"]["max"], 1))
-        for a in s["anomalies"]:
-            known.add(round(a["temperature_2m"], 1))
-            known.add(round(a["windspeed_10m"], 1))
-    return known
+        t, p, w = s["temperature"], s["precipitation"], s["windspeed"]
+        rows.append(
+            f"| {s['city']} | {t['mean']} | {t['min']} | {t['max']} | "
+            f"{p['total_mm']} | {p['rain_hours']}時間 | {w['mean']} | {w['max']} |"
+        )
+    return "\n".join([header, sep, *rows])
 
 
-def verify_numbers(report_text: str, known_values: set[float]) -> list[dict]:
-    """report_text中の「数値+単位」をすべて拾い、known_valuesに（許容誤差内で）
-    一致するものが無ければ、捏造・誤読の疑いがある数値として記録する。"""
-    findings = []
-    for m in NUMBER_UNIT_RE.finditer(report_text):
-        value = float(m.group(1))
-        unit = m.group(2)
-        if any(abs(value - k) <= NUMBER_TOLERANCE for k in known_values):
+def render_anomaly_list(summaries: list[dict]) -> str:
+    lines = []
+    for s in summaries:
+        if not s["anomalies"]:
             continue
-        start, end = max(0, m.start() - 15), min(len(report_text), m.end() + 15)
-        findings.append(
+        lines.append(f"**{s['city']}**")
+        for a in s["anomalies"]:
+            lines.append(
+                f"- {a['time']}: 気温 {a['temperature_2m']}℃ / 風速 {a['windspeed_10m']}m/s"
+            )
+    return "\n".join(lines) if lines else "（該当なし）"
+
+
+def build_rankings(summaries: list[dict]) -> str:
+    """生の数値の代わりに「順位」だけを渡す。LLMの手元には数値が一切無いので、
+    数値を捏造しようにも参照するものがない。"""
+
+    def rank_line(label: str, key) -> str:
+        ordered = sorted(summaries, key=key, reverse=True)
+        return f"- {label}: " + " > ".join(s["city"] for s in ordered)
+
+    lines = [
+        rank_line("平均気温が高い順", lambda s: s["temperature"]["mean"]),
+        rank_line("総降水量が多い順", lambda s: s["precipitation"]["total_mm"]),
+        rank_line("降雨時間が長い順", lambda s: s["precipitation"]["rain_hours"]),
+        rank_line("平均風速が強い順", lambda s: s["windspeed"]["mean"]),
+        rank_line("最大風速が強い順", lambda s: s["windspeed"]["max"]),
+    ]
+
+    anomaly_lines = ["【異常が観測された時刻（都市別、数値は伏せてある）】"]
+    for s in summaries:
+        if not s["anomalies"]:
+            continue
+        times = "、".join(a["time"] for a in s["anomalies"])
+        anomaly_lines.append(f"- {s['city']}: {times}")
+
+    return "\n".join(lines) + "\n\n" + "\n".join(anomaly_lines)
+
+
+def build_prompt(summaries: list[dict]) -> str:
+    rankings = build_rankings(summaries)
+    cities = "、".join(s["city"] for s in summaries)
+    return f"""あなたは気象データ分析の専門家です。日本の4都市（{cities}）の
+2026年5月20日〜26日の気象傾向について、以下の「都市間の順位・相対比較」と
+「異常が観測された時刻」だけをもとに、日本語でレポートを書いてください。
+
+{rankings}
+
+■ 絶対的な制約（重要）
+- 気温(℃)・降水量(mm)・風速(m/s)などの具体的な数値は、あなたには一切与えられていません。
+  したがって数値は絶対に書かないでください。書けば、それは全て捏造です。
+- 使ってよいのは「最も高い/低い」「〜より強い/穏やか」のような相対表現、都市名、
+  上記に示された時刻データのみです。
+
+レポートの構成:
+1. 【都市ごとの特徴】各都市の気温・降水・風速の傾向を定性的に1〜2文で
+2. 【異常が見られた時間帯】示された時刻について、何が起きていた可能性があるか（推測）
+3. 【都市間比較】最も対照的な2都市を挙げ、その違いを定性的に説明
+4. 【総括】この週の気象パターンから言えることを2〜3文で"""
+
+
+def check_narrative_compliance(narrative: str) -> list[dict]:
+    """LLMには数値を書くなと指示した。それでも数値+単位が出現していれば、
+    指示違反=捏造とみなして全て記録する（v1の「既知の値と照合」より厳しい基準）。"""
+    violations = []
+    for m in NUMBER_UNIT_RE.finditer(narrative):
+        start, end = max(0, m.start() - 15), min(len(narrative), m.end() + 15)
+        violations.append(
             {
-                "value": value,
-                "unit": unit,
-                "context": report_text[start:end].replace("\n", " "),
+                "text": m.group(0),
+                "context": narrative[start:end].replace("\n", " "),
             }
         )
-    return findings
+    return violations
 
 
 def call_ollama(prompt: str) -> str:
@@ -154,36 +192,44 @@ def main():
     summaries = [summarize_city(df, c) for c in cities]
 
     prompt = build_prompt(summaries)
-    print(f"[info] {len(cities)}都市のデータを要約し、{MODEL} に送信します...", file=sys.stderr)
-    report = call_ollama(prompt)
+    print(
+        f"[info] {len(cities)}都市の「順位関係」のみを {MODEL} に送信します"
+        "（生の数値は渡しません）...",
+        file=sys.stderr,
+    )
+    narrative = call_ollama(prompt)
 
-    known_values = collect_known_values(summaries)
-    findings = verify_numbers(report, known_values)
-    print(f"[info] 数値検証: {len(findings)}件の疑わしい数値を検出", file=sys.stderr)
+    violations = check_narrative_compliance(narrative)
+    print(f"[info] 指示違反（数値の記載）チェック: {len(violations)}件", file=sys.stderr)
 
     with open("analysis_report.md", "w", encoding="utf-8") as f:
-        f.write("# 気象データLLM分析レポート（プロトタイプ）\n\n")
+        f.write("# 気象データLLM分析レポート（プロトタイプ v2）\n\n")
         f.write(f"- 使用モデル: {MODEL} (Ollama, ローカル実行)\n")
         f.write(f"- 対象都市: {', '.join(cities)}\n")
-        f.write("- 手法: pandasで集計 → LLMが解釈・比較を言語化\n\n")
-        f.write("## 集計データ（LLMへの入力）\n\n```json\n")
-        f.write(json.dumps(summaries, ensure_ascii=False, indent=2))
-        f.write("\n```\n\n## LLMによる分析\n\n")
-        f.write(report)
-
-        f.write("\n\n## 数値検証（自動チェック）\n\n")
         f.write(
-            "上記レポート中の「数値+単位」を正規表現で抽出し、元データ（集計JSON）に\n"
-            f"±{NUMBER_TOLERANCE}の許容誤差で一致する値が存在するかを機械的に確認した結果。\n\n"
+            "- 手法: pandasで集計 → **数値はコードが直接**表・リストに出力し、"
+            "LLMには数値を一切渡さず、順位関係と時刻だけから定性的な解釈・比較を書かせる\n\n"
         )
-        if findings:
-            f.write(f"**{len(findings)}件、元データに存在しない数値を検出しました:**\n\n")
-            for fnd in findings:
-                f.write(
-                    f"- `{fnd['value']}{fnd['unit']}` … 文脈: 「...{fnd['context']}...」\n"
-                )
+
+        f.write("## 集計データ（数値はすべてコードが出力・LLM不介入）\n\n")
+        f.write(render_data_table(summaries))
+        f.write(f"\n\n### 異常値（上位{MAX_ANOMALIES_PER_CITY}件/都市、zスコア基準）\n\n")
+        f.write(render_anomaly_list(summaries))
+
+        f.write("\n\n## LLMによる定性的な解釈・比較\n\n")
+        f.write(narrative)
+
+        f.write("\n\n## 指示遵守チェック（自動）\n\n")
+        f.write(
+            "LLMには「具体的な数値を書くな」と明示的に指示した。"
+            "上記のLLM出力に数値+単位が出現していないかを機械的に確認した結果。\n\n"
+        )
+        if violations:
+            f.write(f"**{len(violations)}件、指示に反して数値が記載されていました:**\n\n")
+            for v in violations:
+                f.write(f"- `{v['text']}` … 文脈: 「...{v['context']}...」\n")
         else:
-            f.write("元データに存在しない数値は検出されませんでした。\n")
+            f.write("数値の記載は検出されませんでした。指示に従っています。\n")
 
     print("[done] analysis_report.md を出力しました", file=sys.stderr)
 
